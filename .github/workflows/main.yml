@@ -1,0 +1,91 @@
+name: PythonRunner V6.3.11 - Xcode Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build PythonRunner
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Vérifier macOS et Xcode
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Vérifier les fichiers PythonRunner
+        run: |
+          echo "=== RACINE ==="
+          ls -la
+
+          echo "=== PythonRunner ==="
+          ls -la PythonRunner || true
+
+          echo "=== Xcode project ==="
+          ls -la PythonRunner.xcodeproj 2>/dev/null || true
+
+      - name: Vérifier setup.sh
+        working-directory: .
+        run: |
+          test -f PythonRunner/setup.sh
+          chmod +x PythonRunner/setup.sh
+
+      - name: Installer Python iOS / Python.xcframework
+        working-directory: PythonRunner
+        run: |
+          ./setup.sh
+
+      - name: Vérifier Python.xcframework
+        working-directory: PythonRunner
+        run: |
+          test -d Frameworks/Python.xcframework
+          test -f Frameworks/Python.xcframework/Info.plist
+
+          echo "✅ Python.xcframework présent"
+
+          echo "=== Framework ==="
+          find Frameworks/Python.xcframework -maxdepth 2 -type d | sort
+
+      - name: Vérifier python_paths.env
+        working-directory: PythonRunner
+        run: |
+          test -f python_paths.env
+          cat python_paths.env
+
+      - name: Vérifier le projet Xcode
+        working-directory: PythonRunner
+        run: |
+          xcodebuild \
+            -project PythonRunner.xcodeproj \
+            -list
+
+      - name: Build iOS Simulator
+        working-directory: PythonRunner
+        run: |
+          xcodebuild \
+            -project PythonRunner.xcodeproj \
+            -scheme PythonRunner \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Vérifier le résultat
+        working-directory: PythonRunner
+        run: |
+          echo "=== Produits ==="
+          find ~/Library/Developer/Xcode/DerivedData \
+            -name "PythonRunner.app" \
+            -print 2>/dev/null || true
+
+          echo "✅ BUILD TERMINÉ"
