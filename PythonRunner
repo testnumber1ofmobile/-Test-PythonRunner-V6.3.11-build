@@ -1,1 +1,2009 @@
+#!/bin/bash
+# ==============================================================================
+# generate_pythonrunner_v6.3.11.sh
+# Un seul fichier : projet iOS + setup.sh + workflow GitHub Actions
+#
+# Corrections :
+#   - PythonRunner/setup.sh créé à la racine du projet généré
+#   - BeeWare .tar.gz conservé dans Frameworks/ (cache CI)
+#   - workflow régénère le projet si setup.sh absent du commit
+#   - cancel sticky, PyConfig, soft finalize
+# ==============================================================================
 
+set -euo pipefail
+
+PROJECT_NAME="PythonRunner"
+PROJECT_DIR="$PROJECT_NAME"
+APP_DIR="$PROJECT_DIR/$PROJECT_NAME"
+RESOURCES_DIR="$APP_DIR/Resources"
+FRAMEWORKS_DIR="$PROJECT_DIR/Frameworks"
+
+PYTHON_VER="3.11"
+BEEWARE_RELEASE="3.11-b9"
+BEEWARE_URL="https://github.com/beeware/Python-Apple-support/releases/download/${BEEWARE_RELEASE}/Python-3.11-iOS-support.b9.tar.gz"
+
+echo "═══════════════════════════════════════════════════════════════"
+echo "  📦  $PROJECT_NAME V6.3.11  (Python $PYTHON_VER / $BEEWARE_RELEASE)"
+echo "═══════════════════════════════════════════════════════════════"
+
+rm -rf "$PROJECT_DIR"
+mkdir -p "$APP_DIR/App" "$APP_DIR/UI" "$APP_DIR/Python" "$RESOURCES_DIR"
+mkdir -p "$APP_DIR/Assets.xcassets/AppIcon.appiconset"
+mkdir -p "$APP_DIR/Assets.xcassets/AccentColor.colorset"
+mkdir -p "$FRAMEWORKS_DIR"
+mkdir -p "$PROJECT_DIR/PythonRunner.xcodeproj/project.xcworkspace"
+mkdir -p "$PROJECT_DIR/PythonRunner.xcodeproj/xcshareddata/xcschemes"
+echo "   ✅ Structure créée"
+
+# ── CancellationState ────────────────────────────────────────────────────────
+cat > "$APP_DIR/Python/CancellationState.swift" << 'SWIFT_EOF'
+import Foundation
+
+/// Thread-safe cancellation flag.
+/// Protocol:
+///   1. beginExecution() → bump generation (ne clear PAS cancel)
+///   2. if isCancelled → honor Stop, PUIS toujours acknowledgeStart() pour consommer le flag
+///   3. sinon acknowledgeStart() puis travailler
+/// Sans l'étape 2, un Stop resterait sticky et bloquerait les runs suivants.
+@objc public final class CancellationState: NSObject {
+    private let lock = NSLock()
+    private var _cancelled = false
+    private var _generation: UInt64 = 0
+
+    @objc public func cancel() {
+        lock.lock()
+        _cancelled = true
+        lock.unlock()
+    }
+
+    /// Bump generation WITHOUT clearing cancel.
+    /// Check isCancelled after this; only then call acknowledgeStart(generation:).
+    @objc public func beginExecution() -> UInt64 {
+        lock.lock()
+        _generation &+= 1
+        let g = _generation
+        lock.unlock()
+        return g
+    }
+
+    /// Clear cancel only after we have started this generation and verified no Stop.
+    @objc public func acknowledgeStart(generation gen: UInt64) {
+        lock.lock()
+        if _generation == gen {
+            _cancelled = false
+        }
+        lock.unlock()
+    }
+
+    @objc public func reset() {
+        lock.lock()
+        _cancelled = false
+        _generation &+= 1
+        lock.unlock()
+    }
+
+    @objc public var isCancelled: Bool {
+        lock.lock(); defer { lock.unlock() }; return _cancelled
+    }
+
+    @objc public func isCancelled(forGeneration gen: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _cancelled && _generation == gen
+    }
+
+    @objc public var generation: UInt64 {
+        lock.lock(); defer { lock.unlock() }; return _generation
+    }
+}
+SWIFT_EOF
+
+# ── ExecutionState ───────────────────────────────────────────────────────────
+cat > "$APP_DIR/Python/ExecutionState.swift" << 'SWIFT_EOF'
+import Foundation
+
+public final class ExecutionState: NSObject {
+    private let lock = NSLock()
+    private var _isFinished = false
+    private var _token: UUID?
+
+    public func finishIfActive(token: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !_isFinished, _token == token else { return false }
+        _isFinished = true
+        return true
+    }
+
+    public func begin(token: UUID) {
+        lock.lock()
+        _isFinished = false
+        _token = token
+        lock.unlock()
+    }
+
+    public func reset() {
+        lock.lock()
+        _isFinished = false
+        _token = nil
+        lock.unlock()
+    }
+}
+SWIFT_EOF
+
+# ── AppDelegate ──────────────────────────────────────────────────────────────
+cat > "$APP_DIR/App/AppDelegate.swift" << 'SWIFT_EOF'
+import UIKit
+
+@main
+final class AppDelegate: UIResponder, UIApplicationDelegate {
+    var window: UIWindow?
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+        window = UIWindow(frame: UIScreen.main.bounds)
+        window?.rootViewController = UINavigationController(rootViewController: MainViewController())
+        window?.makeKeyAndVisible()
+        return true
+    }
+}
+SWIFT_EOF
+
+# ── MainViewController ───────────────────────────────────────────────────────
+cat > "$APP_DIR/UI/MainViewController.swift" << 'SWIFT_EOF'
+import UIKit
+
+final class MainViewController: UIViewController {
+    private let editorView = EditorView()
+    private let outputView = OutputView()
+
+    private let executeButton: UIButton = {
+        let b = UIButton(type: .system)
+        b.setTitle("▶ Exécuter", for: .normal)
+        b.backgroundColor = .systemBlue
+        b.setTitleColor(.white, for: .normal)
+        b.titleLabel?.font = .boldSystemFont(ofSize: 18)
+        b.layer.cornerRadius = 12
+        b.translatesAutoresizingMaskIntoConstraints = false
+        return b
+    }()
+    private let stopButton: UIButton = {
+        let b = UIButton(type: .system)
+        b.setTitle("⏹ Stop", for: .normal)
+        b.backgroundColor = .systemRed
+        b.setTitleColor(.white, for: .normal)
+        b.titleLabel?.font = .boldSystemFont(ofSize: 14)
+        b.layer.cornerRadius = 12
+        b.isHidden = true
+        b.translatesAutoresizingMaskIntoConstraints = false
+        return b
+    }()
+    private let statusLabel: UILabel = {
+        let l = UILabel()
+        l.text = "🐍 Prêt"
+        l.font = .systemFont(ofSize: 12)
+        l.textColor = .systemGreen
+        l.translatesAutoresizingMaskIntoConstraints = false
+        return l
+    }()
+    private let spinner: UIActivityIndicatorView = {
+        let s = UIActivityIndicatorView(style: .medium)
+        s.hidesWhenStopped = true
+        s.translatesAutoresizingMaskIntoConstraints = false
+        return s
+    }()
+    private let toolbar: UIToolbar = {
+        let t = UIToolbar()
+        t.translatesAutoresizingMaskIntoConstraints = false
+        return t
+    }()
+
+    private let pythonRunner = PythonRunner.shared
+    private var pythonReady = false
+    private var executionToken: UUID?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "🐍 Python Runner"
+        view.backgroundColor = .systemBackground
+        editorView.translatesAutoresizingMaskIntoConstraints = false
+        outputView.translatesAutoresizingMaskIntoConstraints = false
+        [editorView, toolbar, executeButton, stopButton, outputView, statusLabel, spinner].forEach { view.addSubview($0) }
+        NSLayoutConstraint.activate([
+            editorView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
+            editorView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
+            editorView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
+            editorView.heightAnchor.constraint(equalTo: view.heightAnchor, multiplier: 0.35),
+            toolbar.topAnchor.constraint(equalTo: editorView.bottomAnchor, constant: 5),
+            toolbar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            toolbar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            toolbar.heightAnchor.constraint(equalToConstant: 44),
+            executeButton.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 22),
+            executeButton.centerXAnchor.constraint(equalTo: view.centerXAnchor, constant: -40),
+            executeButton.widthAnchor.constraint(equalToConstant: 130),
+            executeButton.heightAnchor.constraint(equalToConstant: 50),
+            stopButton.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 22),
+            stopButton.leadingAnchor.constraint(equalTo: executeButton.trailingAnchor, constant: 10),
+            stopButton.widthAnchor.constraint(equalToConstant: 80),
+            stopButton.heightAnchor.constraint(equalToConstant: 50),
+            outputView.topAnchor.constraint(equalTo: executeButton.bottomAnchor, constant: 15),
+            outputView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
+            outputView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
+            outputView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -10),
+            // Status under toolbar, not over the editor
+            statusLabel.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 4),
+            statusLabel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            spinner.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            spinner.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+        ])
+        toolbar.items = [
+            UIBarButtonItem(title: "🗑 Effacer", style: .plain, target: self, action: #selector(clearEditor)),
+            UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil),
+            UIBarButtonItem(title: "📚 Exemples", style: .plain, target: self, action: #selector(showExamples)),
+            UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil),
+            UIBarButtonItem(title: "🔄 Reset", style: .plain, target: self, action: #selector(resetEnvironment)),
+            UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil),
+            UIBarButtonItem(title: "📦 Packages", style: .plain, target: self, action: #selector(showPackages)),
+        ]
+        executeButton.addTarget(self, action: #selector(executeCode), for: .touchUpInside)
+        stopButton.addTarget(self, action: #selector(stopExecution), for: .touchUpInside)
+        view.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard)))
+        initializePython()
+    }
+
+    private func initializePython() {
+        spinner.startAnimating()
+        setStatus("⏳ Initialisation...", .systemOrange)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let ok = self.pythonRunner.initialize()
+            DispatchQueue.main.async {
+                self.spinner.stopAnimating()
+                if ok {
+                    self.pythonReady = true
+                    self.setStatus("✅ Python prêt", .systemGreen)
+                    self.outputView.appendText("✅ Python initialisé\n\n")
+                } else {
+                    self.setStatus("❌ Erreur Python", .systemRed)
+                    self.outputView.appendText("❌ Init échouée — exécutez ./setup.sh puis rebuild\n")
+                }
+            }
+        }
+    }
+
+    @objc private func executeCode() {
+        guard pythonReady else { showAlert("Erreur", "Python non initialisé"); return }
+        let code = editorView.getCode().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !code.isEmpty else { showAlert("Erreur", "Code vide"); return }
+
+        let token = UUID()
+        executionToken = token
+        pythonRunner.executionState.begin(token: token)
+
+        spinner.startAnimating()
+        executeButton.isEnabled = false
+        stopButton.isHidden = false
+        setStatus("⏳ Exécution...", .systemOrange)
+        outputView.appendText("\n" + String(repeating: "═", count: 50) + "\n▶ Exécution :\n")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+
+            let timeoutWork = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                guard self.pythonRunner.executionState.finishIfActive(token: token) else { return }
+                self.pythonRunner.cancelExecution()
+                PY_ScheduleInterrupt()
+                self.executionFinished(token: token, result: .init(error: "⏱ Timeout 30s (coopératif)"), fromTimeout: true)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timeoutWork)
+
+            let result = self.pythonRunner.execute(code, token: token)
+            timeoutWork.cancel()
+            guard self.pythonRunner.executionState.finishIfActive(token: token) else { return }
+            self.executionFinished(token: token, result: result, fromTimeout: false)
+        }
+    }
+
+    private func executionFinished(token: UUID, result: PythonResult, fromTimeout: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.executionToken == token else { return }
+            self.spinner.stopAnimating()
+            self.executeButton.isEnabled = true
+            self.stopButton.isHidden = true
+            self.executionToken = nil
+            if let err = result.error {
+                self.outputView.appendText("❌ \(err)\n")
+                self.setStatus(fromTimeout ? "⏱ Timeout" : "❌ Erreur", .systemRed)
+            } else {
+                if !result.output.isEmpty { self.outputView.appendText("📤 \(result.output)") }
+                if !result.result.isEmpty && result.result != "None" {
+                    self.outputView.appendText("📊 \(result.result)\n")
+                }
+                self.setStatus("✅ Succès", .systemGreen)
+            }
+            self.outputView.appendText(String(repeating: "═", count: 50) + "\n")
+            self.outputView.scrollToBottom()
+        }
+    }
+
+    @objc private func stopExecution() {
+        pythonRunner.cancelExecution()
+        PY_ScheduleInterrupt()
+        outputView.appendText("⏹ Annulation coopérative...\n")
+    }
+    @objc private func clearEditor() {
+        editorView.clear(); outputView.clear(); outputView.appendText("📋 Effacé\n")
+    }
+    @objc private func resetEnvironment() {
+        pythonRunner.resetEnvironment()
+        outputView.appendText("🔄 Reset namespaces\n")
+    }
+    @objc private func showExamples() {
+        let ac = UIAlertController(title: "📚 Exemples", message: nil, preferredStyle: .actionSheet)
+        ac.addAction(UIAlertAction(title: "Hello", style: .default) { _ in
+            self.editorView.setCode("print(\"Hello World !\")")
+        })
+        ac.addAction(UIAlertAction(title: "Expression", style: .default) { _ in
+            self.editorView.setCode("1 + 2 * 3")
+        })
+        ac.addAction(UIAlertAction(title: "x=10 puis x", style: .default) { _ in
+            self.editorView.setCode("x = 10\nx")
+        })
+        ac.addAction(UIAlertAction(title: "Fibonacci", style: .default) { _ in
+            self.editorView.setCode("def fib(n):\n    return n if n<=1 else fib(n-1)+fib(n-2)\nfor i in range(10):\n    print(f\"F({i})={fib(i)}\")")
+        })
+        ac.addAction(UIAlertAction(title: "Annuler", style: .cancel))
+        if let p = ac.popoverPresentationController { p.barButtonItem = toolbar.items?[2] }
+        present(ac, animated: true)
+    }
+    @objc private func showPackages() {
+        setStatus("⏳ Packages...", .systemOrange)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let pkgs = self.pythonRunner.getInstalledPackages()
+            let msg = pkgs.isEmpty ? "Stdlib uniquement (pas de packages tiers installés)." : pkgs.joined(separator: "\n")
+            DispatchQueue.main.async {
+                self.setStatus("✅ Python prêt", .systemGreen)
+                let ac = UIAlertController(title: "📦 Packages présents", message: msg, preferredStyle: .actionSheet)
+                ac.addAction(UIAlertAction(title: "Fermer", style: .cancel))
+                if let p = ac.popoverPresentationController { p.barButtonItem = self.toolbar.items?[6] }
+                self.present(ac, animated: true)
+            }
+        }
+    }
+    @objc private func dismissKeyboard() { view.endEditing(true) }
+    private func setStatus(_ t: String, _ c: UIColor) { statusLabel.text = t; statusLabel.textColor = c }
+    private func showAlert(_ t: String, _ m: String) {
+        let ac = UIAlertController(title: t, message: m, preferredStyle: .alert)
+        ac.addAction(UIAlertAction(title: "OK", style: .default))
+        present(ac, animated: true)
+    }
+}
+SWIFT_EOF
+
+# ── EditorView ───────────────────────────────────────────────────────────────
+cat > "$APP_DIR/UI/EditorView.swift" << 'SWIFT_EOF'
+import UIKit
+
+final class EditorView: UIView {
+    private let textView: UITextView = {
+        let tv = UITextView()
+        tv.font = .monospacedSystemFont(ofSize: 15, weight: .regular)
+        tv.backgroundColor = UIColor(white: 0.95, alpha: 1)
+        tv.layer.cornerRadius = 10
+        tv.layer.borderWidth = 1
+        tv.layer.borderColor = UIColor.lightGray.cgColor
+        tv.autocorrectionType = .no
+        tv.autocapitalizationType = .none
+        tv.smartQuotesType = .no
+        tv.smartDashesType = .no
+        tv.translatesAutoresizingMaskIntoConstraints = false
+        return tv
+    }()
+    private let gutterView: UIView = {
+        let v = UIView()
+        v.backgroundColor = UIColor(white: 0.9, alpha: 1)
+        v.translatesAutoresizingMaskIntoConstraints = false
+        return v
+    }()
+    private let lineNumbers: UITextView = {
+        let tv = UITextView()
+        tv.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        tv.textColor = .gray
+        tv.backgroundColor = .clear
+        tv.isEditable = false
+        tv.isSelectable = false
+        tv.isScrollEnabled = false
+        tv.translatesAutoresizingMaskIntoConstraints = false
+        return tv
+    }()
+    private let placeholder: UILabel = {
+        let l = UILabel()
+        l.text = "Code Python..."
+        l.textColor = .lightGray
+        l.font = .systemFont(ofSize: 15)
+        l.translatesAutoresizingMaskIntoConstraints = false
+        return l
+    }()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        [gutterView, lineNumbers, textView, placeholder].forEach { addSubview($0) }
+        NSLayoutConstraint.activate([
+            gutterView.topAnchor.constraint(equalTo: textView.topAnchor),
+            gutterView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            gutterView.bottomAnchor.constraint(equalTo: textView.bottomAnchor),
+            gutterView.widthAnchor.constraint(equalToConstant: 40),
+            lineNumbers.topAnchor.constraint(equalTo: textView.topAnchor, constant: 8),
+            lineNumbers.leadingAnchor.constraint(equalTo: leadingAnchor),
+            lineNumbers.bottomAnchor.constraint(equalTo: textView.bottomAnchor, constant: -8),
+            lineNumbers.widthAnchor.constraint(equalToConstant: 40),
+            textView.topAnchor.constraint(equalTo: topAnchor),
+            textView.leadingAnchor.constraint(equalTo: gutterView.trailingAnchor),
+            textView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            textView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            placeholder.topAnchor.constraint(equalTo: topAnchor, constant: 12),
+            placeholder.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 48)
+        ])
+        textView.delegate = self
+        textView.text = "# PythonRunner V6.3.11\nprint(\"Hello World !\")\n\n1 + 2"
+        placeholder.isHidden = true
+        updateLineNumbers()
+        textView.addObserver(self, forKeyPath: "contentOffset", options: .new, context: nil)
+    }
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?,
+                               change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
+        if keyPath == "contentOffset" { lineNumbers.contentOffset = textView.contentOffset }
+    }
+    deinit { textView.removeObserver(self, forKeyPath: "contentOffset") }
+    required init?(coder: NSCoder) { fatalError() }
+    private func updateLineNumbers() {
+        let n = max((textView.text ?? "").components(separatedBy: .newlines).count, 1)
+        lineNumbers.text = (1...n).map(String.init).joined(separator: "\n")
+    }
+    func getCode() -> String { textView.text ?? "" }
+    func setCode(_ c: String) { textView.text = c; placeholder.isHidden = !c.isEmpty; updateLineNumbers() }
+    func clear() { textView.text = ""; placeholder.isHidden = false; updateLineNumbers() }
+}
+extension EditorView: UITextViewDelegate {
+    func textViewDidChange(_ textView: UITextView) {
+        updateLineNumbers()
+        placeholder.isHidden = !(textView.text ?? "").isEmpty
+    }
+}
+SWIFT_EOF
+
+# ── OutputView ───────────────────────────────────────────────────────────────
+cat > "$APP_DIR/UI/OutputView.swift" << 'SWIFT_EOF'
+import UIKit
+
+final class OutputView: UIView {
+    private let textView: UITextView = {
+        let tv = UITextView()
+        tv.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        tv.backgroundColor = UIColor(white: 0.1, alpha: 1)
+        tv.textColor = UIColor(red: 0, green: 1, blue: 0, alpha: 1)
+        tv.layer.cornerRadius = 10
+        tv.isEditable = false
+        tv.translatesAutoresizingMaskIntoConstraints = false
+        return tv
+    }()
+    private let titleLabel: UILabel = {
+        let l = UILabel()
+        l.text = "📋 Sortie"
+        l.font = .boldSystemFont(ofSize: 14)
+        l.textColor = .gray
+        l.translatesAutoresizingMaskIntoConstraints = false
+        return l
+    }()
+    private let copyBtn: UIButton = {
+        let b = UIButton(type: .system)
+        b.setTitle("📋 Copier", for: .normal)
+        b.titleLabel?.font = .systemFont(ofSize: 12)
+        b.translatesAutoresizingMaskIntoConstraints = false
+        return b
+    }()
+    private let clearBtn: UIButton = {
+        let b = UIButton(type: .system)
+        b.setTitle("🗑", for: .normal)
+        b.titleLabel?.font = .systemFont(ofSize: 12)
+        b.setTitleColor(.red, for: .normal)
+        b.translatesAutoresizingMaskIntoConstraints = false
+        return b
+    }()
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = UIColor(white: 0.1, alpha: 1)
+        layer.cornerRadius = 10
+        clipsToBounds = true
+        [textView, titleLabel, copyBtn, clearBtn].forEach { addSubview($0) }
+        NSLayoutConstraint.activate([
+            titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            clearBtn.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+            clearBtn.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            copyBtn.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+            copyBtn.trailingAnchor.constraint(equalTo: clearBtn.leadingAnchor, constant: -8),
+            textView.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
+            textView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            textView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            textView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8)
+        ])
+        copyBtn.addTarget(self, action: #selector(copyOutput), for: .touchUpInside)
+        clearBtn.addTarget(self, action: #selector(clearOutput), for: .touchUpInside)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    func appendText(_ t: String) { DispatchQueue.main.async { self.textView.text += t } }
+    func clear() { textView.text = "" }
+    func scrollToBottom() {
+        guard textView.text.count > 0 else { return }
+        textView.scrollRangeToVisible(NSRange(location: textView.text.count - 1, length: 0))
+    }
+    @objc private func copyOutput() {
+        UIPasteboard.general.string = textView.text
+        copyBtn.setTitle("✅", for: .normal)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.copyBtn.setTitle("📋 Copier", for: .normal) }
+    }
+    @objc private func clearOutput() { textView.text = ""; appendText("📋 Effacé\n") }
+}
+SWIFT_EOF
+
+# ── Headers ──────────────────────────────────────────────────────────────────
+cat > "$APP_DIR/Python/PythonWrapper.h" << 'C_EOF'
+#ifndef PythonWrapper_h
+#define PythonWrapper_h
+
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+BOOL PY_Initialize(const char *homePath);
+void PY_Finalize(void); /* soft: clears our globals, does NOT call Py_Finalize() */
+void PY_ConfigurePath(const char *libPath, const char *dynloadPath, const char *sitePackagesPath);
+NSDictionary *PY_ExecuteCode(const char *code, void * _Nullable cancellationState);
+void PY_ScheduleInterrupt(void);
+void PY_ResetEnvironment(void);
+
+NS_ASSUME_NONNULL_END
+
+#endif /* PythonWrapper_h */
+C_EOF
+
+cat > "$APP_DIR/Python/PythonRunner-Bridging-Header.h" << 'C_EOF'
+#ifndef PythonRunner_Bridging_Header_h
+#define PythonRunner_Bridging_Header_h
+
+#include <Python/Python.h>
+#import "PythonWrapper.h"
+
+#endif /* PythonRunner_Bridging_Header_h */
+C_EOF
+
+# ── PythonRunner.swift ───────────────────────────────────────────────────────
+cat > "$APP_DIR/Python/PythonRunner.swift" << 'SWIFT_EOF'
+import Foundation
+
+@objc(PythonResult)
+public class PythonResult: NSObject {
+    @objc public let output: String
+    @objc public let result: String
+    @objc public let error: String?
+    @objc public var isSuccess: Bool { error == nil }
+    @objc public init(output: String = "", result: String = "", error: String? = nil) {
+        self.output = output; self.result = result; self.error = error
+    }
+}
+
+@objc(PythonRunner)
+public class PythonRunner: NSObject {
+    @objc public static let shared = PythonRunner()
+    private override init() {}
+    @objc private(set) public var isInitialized = false
+    private let pythonQueue = DispatchQueue(label: "com.pythonrunner.python.queue", qos: .userInitiated)
+    private let cancellationState = CancellationState()
+    public let executionState = ExecutionState()
+    private let pythonVersion = "3.11"
+
+    @objc public func initialize() -> Bool {
+        pythonQueue.sync {
+            if isInitialized { return true }
+            guard let resPath = Bundle.main.resourcePath else { print("❌ no resourcePath"); return false }
+            let pythonHome = "\(resPath)/python"
+            let pythonLib = "\(pythonHome)/lib/python\(pythonVersion)"
+            let fm = FileManager.default
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: pythonLib, isDirectory: &isDir), isDir.boolValue else {
+                print("❌ Stdlib manquante: \(pythonLib)"); return false
+            }
+            for f in ["os.py", "site.py"] {
+                guard fm.fileExists(atPath: "\(pythonLib)/\(f)") else {
+                    print("❌ Manquant \(f)"); return false
+                }
+            }
+            let ok = pythonHome.withCString { PY_Initialize($0) }
+            if ok {
+                isInitialized = true
+                let dyn = "\(pythonLib)/lib-dynload"
+                let site = "\(pythonLib)/site-packages"
+                pythonLib.withCString { lib in
+                    dyn.withCString { d in
+                        site.withCString { s in PY_ConfigurePath(lib, d, s) }
+                    }
+                }
+                print("✅ PYTHONHOME=\(pythonHome)")
+            }
+            return isInitialized
+        }
+    }
+
+    @objc public func finalize() {
+        /* Soft finalize: clears namespaces only; interpreter stays alive for app life. */
+        pythonQueue.sync {
+            guard isInitialized else { return }
+            PY_Finalize()
+            /* keep isInitialized == true — matches soft C finalize */
+        }
+    }
+
+    public func execute(_ code: String, token: UUID? = nil) -> PythonResult {
+        pythonQueue.sync {
+            guard isInitialized else { return PythonResult(error: "Python non initialisé") }
+            let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return PythonResult(error: "Code vide") }
+
+            // 1) Bump generation WITHOUT clearing cancel (Stop pendant la file d'attente).
+            // 2) Si cancel déjà posé → honorer Stop PUIS acknowledgeStart (consommer le flag).
+            //    Sans ça, Stop resterait sticky et bloquerait toutes les exécutions suivantes.
+            // 3) Sinon acknowledgeStart puis exécuter.
+            let gen = cancellationState.beginExecution()
+            if cancellationState.isCancelled {
+                cancellationState.acknowledgeStart(generation: gen) // consomme le cancel
+                return PythonResult(error: "⏹ Annulé")
+            }
+            cancellationState.acknowledgeStart(generation: gen)
+
+            let opaque = Unmanaged.passUnretained(cancellationState).toOpaque()
+            let dict = trimmed.withCString { PY_ExecuteCode($0, opaque) } as NSDictionary
+            let output = (dict["stdout"] as? String) ?? ""
+            let r = (dict["result"] as? String) ?? ""
+            let error = dict["error"] as? String
+            if cancellationState.isCancelled {
+                return PythonResult(output: output, result: r, error: error ?? "⏹ Annulé")
+            }
+            return PythonResult(output: output, result: r, error: error)
+        }
+    }
+
+    @objc public func cancelExecution() { cancellationState.cancel() }
+
+    @objc public func resetEnvironment() {
+        pythonQueue.sync {
+            guard isInitialized else { return }
+            PY_ResetEnvironment()
+        }
+    }
+
+    @objc public func getInstalledPackages() -> [String] {
+        pythonQueue.sync {
+            guard isInitialized else { return [] }
+            // Same generation protocol as execute — does not wipe an in-flight Stop.
+            let gen = cancellationState.beginExecution()
+            if cancellationState.isCancelled {
+                cancellationState.acknowledgeStart(generation: gen) // consomme le cancel
+                return []
+            }
+            cancellationState.acknowledgeStart(generation: gen)
+            let code = """
+            import importlib.metadata as md
+            for d in sorted(md.distributions(), key=lambda x: x.name or ''):
+                print(f"{d.name}=={d.version}")
+            """
+            let opaque = Unmanaged.passUnretained(cancellationState).toOpaque()
+            let dict = code.withCString { PY_ExecuteCode($0, opaque) } as NSDictionary
+            let output = (dict["stdout"] as? String) ?? ""
+            return output.components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+        }
+    }
+}
+SWIFT_EOF
+
+# ── PythonWrapper.m ──────────────────────────────────────────────────────────
+cat > "$APP_DIR/Python/PythonWrapper.m" << 'OBJC_EOF'
+#import "PythonWrapper.h"
+#include <Python/Python.h>
+#import "PythonRunner-Swift.h"
+
+static BOOL _initialized = NO;
+static NSMutableString *_capturedOutput = nil;
+static PyObject *_globalGlobals = NULL;
+static PyObject *_globalLocals = NULL;
+
+static PyObject *Capture_write(PyObject *self, PyObject *args) {
+    PyObject *textObj;
+    if (!PyArg_ParseTuple(args, "O", &textObj)) { Py_RETURN_NONE; }
+    PyObject *strObj = PyObject_Str(textObj);
+    if (strObj) {
+        const char *text = PyUnicode_AsUTF8(strObj);
+        if (text && _capturedOutput) {
+            @synchronized(_capturedOutput) { [_capturedOutput appendString:@(text)]; }
+        }
+        Py_DECREF(strObj);
+    }
+    Py_RETURN_NONE;
+}
+static PyObject *Capture_flush(PyObject *self, PyObject *args) { Py_RETURN_NONE; }
+static PyMethodDef CaptureMethods[] = {
+    {"write", Capture_write, METH_VARARGS, "write"},
+    {"flush", Capture_flush, METH_VARARGS, "flush"},
+    {NULL, NULL, 0, NULL}
+};
+static PyTypeObject CaptureType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "capture.Capture",
+    .tp_basicsize = sizeof(PyObject),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_doc = "stdout/stderr capture",
+    .tp_methods = CaptureMethods,
+    .tp_new = PyType_GenericNew,
+};
+
+static int _interrupt_callback(void *arg) {
+    (void)arg;
+    PyErr_SetString(PyExc_KeyboardInterrupt, "Interruption coopérative");
+    return -1;
+}
+void PY_ScheduleInterrupt(void) {
+    if (!_initialized) return;
+    /* 0 = queued, -1 = queue full / failed — best-effort cooperative interrupt */
+    if (Py_AddPendingCall(_interrupt_callback, NULL) != 0) {
+        /* Fallback: set interrupt flag directly when pending-call queue is full */
+        PyErr_SetInterrupt();
+    }
+}
+
+static NSString *FormatException(PyObject *type, PyObject *value, PyObject *tb) {
+    NSString *result = nil;
+    PyObject *tbMod = PyImport_ImportModule("traceback");
+    if (!tbMod) {
+        if (value) {
+            PyObject *eStr = PyObject_Str(value);
+            if (eStr) {
+                const char *txt = PyUnicode_AsUTF8(eStr);
+                if (txt) result = @(txt);
+                Py_DECREF(eStr);
+            }
+        }
+        return result ?: @"Erreur Python";
+    }
+    PyObject *lines = tb
+        ? PyObject_CallMethod(tbMod, "format_exception", "OOO", type ?: Py_None, value ?: Py_None, tb)
+        : PyObject_CallMethod(tbMod, "format_exception_only", "OO", type ?: Py_None, value ?: Py_None);
+    if (lines && PyList_Check(lines)) {
+        PyObject *sep = PyUnicode_FromString("");
+        if (sep) {
+            PyObject *joined = PyObject_CallMethod(sep, "join", "O", lines);
+            if (joined) {
+                const char *txt = PyUnicode_AsUTF8(joined);
+                if (txt) result = @(txt);
+                Py_DECREF(joined);
+            }
+            Py_DECREF(sep);
+        }
+    }
+    Py_XDECREF(lines);
+    Py_DECREF(tbMod);
+    return result ?: @"Erreur Python";
+}
+
+static BOOL IsCancelled(void *cs) {
+    if (!cs) return NO;
+    CancellationState *state = (__bridge CancellationState *)cs;
+    return [state isCancelled];
+}
+
+static NSString *LastNonEmptyLine(const char *code) {
+    NSString *s = [NSString stringWithUTF8String:code];
+    if (!s) return nil;
+    NSArray *lines = [s componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    for (NSInteger i = (NSInteger)lines.count - 1; i >= 0; i--) {
+        NSString *line = [lines[i] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (line.length > 0 && ![line hasPrefix:@"#"]) return line;
+    }
+    return nil;
+}
+
+static BOOL LooksLikeCompoundStart(NSString *line) {
+    static NSArray *kw;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        kw = @[@"if",@"elif",@"else",@"for",@"while",@"try",@"except",@"finally",@"with",
+               @"def",@"class",@"match",@"case",@"return",@"yield",@"raise",@"assert",
+               @"import",@"from",@"global",@"nonlocal",@"pass",@"break",@"continue",@"del",@"async",@"await"];
+    });
+    NSString *first = nil;
+    for (NSString *p in [line componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]]) {
+        if (p.length) { first = p; break; }
+    }
+    if (!first) return YES;
+    if ([first hasSuffix:@":"]) first = [first substringToIndex:first.length - 1];
+    return [kw containsObject:first];
+}
+
+BOOL PY_Initialize(const char *homePath) {
+    /* Only _initialized means "our capture/globals are ready".
+       If Py_IsInitialized() but !_initialized, a previous partial init failed —
+       continue setup instead of returning YES blindly. */
+    if (_initialized) return YES;
+
+    // Une seule stratégie d'init : PyPreConfig + PyConfig (BeeWare / CPython 3.11)
+    // Skip interpreter bootstrap if a previous partial init already started Python.
+    if (!Py_IsInitialized()) {
+        PyPreConfig preconfig;
+        PyPreConfig_InitPythonConfig(&preconfig);
+        preconfig.utf8_mode = 1;
+        preconfig.configure_locale = 0;
+
+        PyStatus status = Py_PreInitialize(&preconfig);
+        if (PyStatus_Exception(status)) {
+            return NO;
+        }
+
+        PyConfig config;
+        PyConfig_InitPythonConfig(&config);
+        config.write_bytecode = 0;
+        config.buffered_stdio = 0;
+        config.install_signal_handlers = 0;
+        config.use_environment = 0;
+        /* PyConfig_SetBytesString owns the conversion; PyConfig_Clear frees it. */
+        status = PyConfig_SetBytesString(&config, &config.home, homePath);
+        if (PyStatus_Exception(status)) {
+            PyConfig_Clear(&config);
+            return NO;
+        }
+
+        status = Py_InitializeFromConfig(&config);
+        PyConfig_Clear(&config);
+        if (PyStatus_Exception(status) || !Py_IsInitialized()) {
+            return NO;
+        }
+    }
+
+    _capturedOutput = [NSMutableString string];
+
+    PyGILState_STATE g = PyGILState_Ensure();
+    if (PyType_Ready(&CaptureType) < 0) {
+        PyGILState_Release(g);
+        /* leave interpreter up; mark as failed init */
+        return NO;
+    }
+    PyObject *cap = PyObject_CallObject((PyObject *)&CaptureType, NULL);
+    if (cap) {
+        PyObject *sys = PyImport_ImportModule("sys");
+        if (sys) {
+            PyObject_SetAttrString(sys, "stdout", cap);
+            PyObject_SetAttrString(sys, "stderr", cap);
+            Py_DECREF(sys);
+        }
+        Py_DECREF(cap);
+    }
+    _globalGlobals = PyDict_New();
+    _globalLocals = PyDict_New();
+    if (_globalGlobals) {
+        PyObject *b = PyImport_ImportModule("builtins");
+        if (b) { PyDict_SetItemString(_globalGlobals, "__builtins__", b); Py_DECREF(b); }
+        PyObject *n = PyUnicode_FromString("__main__");
+        if (n) { PyDict_SetItemString(_globalGlobals, "__name__", n); Py_DECREF(n); }
+    }
+    PyGILState_Release(g);
+    _initialized = YES;
+    return YES;
+}
+
+void PY_Finalize(void) {
+    /* Soft finalize for embedded iOS: do NOT call Py_Finalize().
+       Re-init after Py_Finalize is fragile with extensions / dynload.
+       We only release our own globals; interpreter stays alive for app lifetime. */
+    if (!_initialized) return;
+    PyGILState_STATE g = PyGILState_Ensure();
+    if (_globalGlobals) { Py_DECREF(_globalGlobals); _globalGlobals = NULL; }
+    if (_globalLocals) { Py_DECREF(_globalLocals); _globalLocals = NULL; }
+    _capturedOutput = nil;
+    PyGILState_Release(g);
+    /* keep _initialized = YES so a later initialize() is a no-op */
+}
+
+void PY_ConfigurePath(const char *libPath, const char *dynloadPath, const char *sitePackagesPath) {
+    if (!_initialized) return;
+    PyGILState_STATE g = PyGILState_Ensure();
+    PyObject *sys = PyImport_ImportModule("sys");
+    if (sys) {
+        PyObject *path = PyObject_GetAttrString(sys, "path");
+        if (path && PyList_Check(path)) {
+            PyObject *a = PyUnicode_FromString(libPath);
+            PyObject *b = PyUnicode_FromString(dynloadPath);
+            PyObject *c = PyUnicode_FromString(sitePackagesPath);
+            if (a) { PyList_Append(path, a); Py_DECREF(a); }
+            if (b) { PyList_Append(path, b); Py_DECREF(b); }
+            if (c) { PyList_Append(path, c); Py_DECREF(c); }
+            Py_DECREF(path);
+        }
+        Py_DECREF(sys);
+    }
+    PyGILState_Release(g);
+}
+
+void PY_ResetEnvironment(void) {
+    if (!_initialized) return;
+    PyGILState_STATE g = PyGILState_Ensure();
+
+    /* Safe reset: only rebuild __main__ namespaces.
+       Do NOT purge sys.modules — that can break stdlib / extension state. */
+    PyObject *oldOut = NULL, *oldErr = NULL;
+    PyObject *sys = PyImport_ImportModule("sys");
+    if (sys) {
+        oldOut = PyObject_GetAttrString(sys, "stdout");
+        oldErr = PyObject_GetAttrString(sys, "stderr");
+        Py_DECREF(sys);
+    }
+
+    if (_globalGlobals) { Py_DECREF(_globalGlobals); _globalGlobals = NULL; }
+    if (_globalLocals)  { Py_DECREF(_globalLocals);  _globalLocals  = NULL; }
+
+    _globalGlobals = PyDict_New();
+    _globalLocals  = PyDict_New();
+    if (_globalGlobals) {
+        PyObject *b = PyImport_ImportModule("builtins");
+        if (b) { PyDict_SetItemString(_globalGlobals, "__builtins__", b); Py_DECREF(b); }
+        PyObject *n = PyUnicode_FromString("__main__");
+        if (n) { PyDict_SetItemString(_globalGlobals, "__name__", n); Py_DECREF(n); }
+    }
+
+    if (oldOut || oldErr) {
+        PyObject *sys2 = PyImport_ImportModule("sys");
+        if (sys2) {
+            if (oldOut) PyObject_SetAttrString(sys2, "stdout", oldOut);
+            if (oldErr) PyObject_SetAttrString(sys2, "stderr", oldErr);
+            Py_DECREF(sys2);
+        }
+    }
+    Py_XDECREF(oldOut);
+    Py_XDECREF(oldErr);
+    PyGILState_Release(g);
+}
+
+NSDictionary *PY_ExecuteCode(const char *code, void *cancellationState) {
+    if (!_initialized || !Py_IsInitialized()) {
+        return @{@"error": @"Python non initialisé"};
+    }
+    @synchronized(_capturedOutput) { [_capturedOutput setString:@""]; }
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    PyGILState_STATE g = PyGILState_Ensure();
+
+    if (IsCancelled(cancellationState)) {
+        result[@"error"] = @"Annulé avant compile";
+        PyGILState_Release(g);
+        return result;
+    }
+
+    PyObject *codeObj = Py_CompileString(code, "<string>", Py_eval_input);
+    BOOL isExpr = (codeObj != NULL);
+    if (!codeObj) {
+        PyErr_Clear();
+        codeObj = Py_CompileString(code, "<string>", Py_file_input);
+    }
+    if (!codeObj) {
+        PyObject *t = NULL, *v = NULL, *tb = NULL;
+        PyErr_Fetch(&t, &v, &tb);
+        result[@"error"] = FormatException(t, v, tb);
+        Py_XDECREF(t); Py_XDECREF(v); Py_XDECREF(tb);
+        PyGILState_Release(g);
+        return result;
+    }
+
+    if (IsCancelled(cancellationState)) {
+        Py_DECREF(codeObj);
+        result[@"error"] = @"Annulé avant eval";
+        PyGILState_Release(g);
+        return result;
+    }
+
+    PyObject *ret = PyEval_EvalCode(codeObj, _globalGlobals, _globalLocals);
+    Py_DECREF(codeObj);
+
+    if (ret) {
+        if (isExpr && ret != Py_None) {
+            PyObject *r = PyObject_Repr(ret);
+            if (r) {
+                const char *t = PyUnicode_AsUTF8(r);
+                if (t) result[@"result"] = @(t);
+                Py_DECREF(r);
+            }
+        }
+        Py_DECREF(ret);
+
+        /* last-line uniquement si multi-lignes */
+        if (!isExpr && !result[@"result"]) {
+            NSString *full = [[NSString stringWithUTF8String:code]
+                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            NSString *last = LastNonEmptyLine(code);
+            BOOL multiLine = (last.length > 0 && full.length > 0 && ![full isEqualToString:last]);
+
+            if (multiLine && !LooksLikeCompoundStart(last)) {
+                PyObject *ec = Py_CompileString(last.UTF8String, "<string>", Py_eval_input);
+                if (ec) {
+                    PyObject *er = PyEval_EvalCode(ec, _globalGlobals, _globalLocals);
+                    Py_DECREF(ec);
+                    if (er) {
+                        if (er != Py_None) {
+                            PyObject *r = PyObject_Repr(er);
+                            if (r) {
+                                const char *t = PyUnicode_AsUTF8(r);
+                                if (t) result[@"result"] = @(t);
+                                Py_DECREF(r);
+                            }
+                        }
+                        Py_DECREF(er);
+                    } else {
+                        PyErr_Clear();
+                    }
+                } else {
+                    PyErr_Clear();
+                }
+            }
+        }
+    } else {
+        PyObject *t = NULL, *v = NULL, *tb = NULL;
+        PyErr_Fetch(&t, &v, &tb);
+        PyErr_NormalizeException(&t, &v, &tb);
+        if (t && PyErr_GivenExceptionMatches(t, PyExc_KeyboardInterrupt)) {
+            result[@"error"] = @"⏹ Interruption coopérative";
+        } else {
+            result[@"error"] = FormatException(t, v, tb);
+        }
+        Py_XDECREF(t); Py_XDECREF(v); Py_XDECREF(tb);
+    }
+
+    PyGILState_Release(g);
+
+    @synchronized(_capturedOutput) {
+        if (_capturedOutput.length) result[@"stdout"] = [_capturedOutput copy];
+    }
+    if (!result[@"stdout"] && !result[@"error"] && !result[@"result"]) {
+        result[@"result"] = @"None";
+    }
+    return result;
+}
+OBJC_EOF
+
+# ── Info.plist (VALIDE) ──────────────────────────────────────────────────────
+cat > "$RESOURCES_DIR/Info.plist" << 'PLIST_EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>fr</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.pythonrunner.ios</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>PythonRunner</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+</dict>
+</plist>
+PLIST_EOF
+
+# ── LaunchScreen.storyboard (VALIDE) ─────────────────────────────────────────
+cat > "$RESOURCES_DIR/LaunchScreen.storyboard" << 'XML_EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<document type="com.apple.InterfaceBuilder3.CocoaTouch.Storyboard.XIB" version="3.0" toolsVersion="21701" targetRuntime="iOS.CocoaTouch" propertyAccessControl="none" useAutolayout="YES" launchScreen="YES" useTraitCollections="YES" useSafeAreas="YES" colorMatched="YES" initialViewController="01J-lp-oVM">
+    <device id="retina6_12" orientation="portrait" appearance="light"/>
+    <dependencies>
+        <deployment identifier="iOS"/>
+        <plugIn identifier="com.apple.InterfaceBuilder.IBCocoaTouchPlugin" version="21679"/>
+        <capability name="Safe area layout guides" minToolsVersion="9.0"/>
+        <capability name="documents saved in the Xcode 8 format" minToolsVersion="8.0"/>
+    </dependencies>
+    <scenes>
+        <scene sceneID="EHf-IW-A2E">
+            <objects>
+                <viewController id="01J-lp-oVM" sceneMemberID="viewController">
+                    <view key="view" contentMode="scaleToFill" id="Ze5-6b-2t3">
+                        <rect key="frame" x="0.0" y="0.0" width="393" height="852"/>
+                        <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
+                        <subviews>
+                            <label opaque="NO" userInteractionEnabled="NO" contentMode="left" horizontalHuggingPriority="251" verticalHuggingPriority="251" text="🐍 Python Runner" textAlignment="center" lineBreakMode="tailTruncation" baselineAdjustment="alignBaselines" adjustsFontSizeToFit="NO" translatesAutoresizingMaskIntoConstraints="NO" id="GJd-Yh-RWb">
+                                <rect key="frame" x="20" y="406" width="353" height="40"/>
+                                <fontDescription key="fontDescription" type="system" weight="thin" pointSize="36"/>
+                                <nil key="highlightedColor"/>
+                            </label>
+                        </subviews>
+                        <viewLayoutGuide key="safeArea" id="6Tk-OE-BBY"/>
+                        <color key="backgroundColor" systemColor="systemBackgroundColor"/>
+                        <constraints>
+                            <constraint firstItem="GJd-Yh-RWb" firstAttribute="centerY" secondItem="Ze5-6b-2t3" secondAttribute="centerY" id="Q3B-4B-g5h"/>
+                            <constraint firstItem="GJd-Yh-RWb" firstAttribute="leading" secondItem="Ze5-6b-2t3" secondAttribute="leading" constant="20" id="YjE-ue-Wcj"/>
+                            <constraint firstAttribute="trailing" secondItem="GJd-Yh-RWb" secondAttribute="trailing" constant="20" id="dky-O4-jgt"/>
+                        </constraints>
+                    </view>
+                </viewController>
+                <placeholder placeholderIdentifier="IBFirstResponder" id="iYj-Kq-Ea1" userLabel="First Responder" sceneMemberID="firstResponder"/>
+            </objects>
+            <point key="canvasLocation" x="53" y="375"/>
+        </scene>
+    </scenes>
+</document>
+XML_EOF
+
+# ── Assets ───────────────────────────────────────────────────────────────────
+cat > "$APP_DIR/Assets.xcassets/Contents.json" << 'JSON_EOF'
+{"info":{"author":"xcode","version":1}}
+JSON_EOF
+cat > "$APP_DIR/Assets.xcassets/AppIcon.appiconset/Contents.json" << 'JSON_EOF'
+{"images":[{"idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}
+JSON_EOF
+cat > "$APP_DIR/Assets.xcassets/AccentColor.colorset/Contents.json" << 'JSON_EOF'
+{"colors":[{"idiom":"universal"}],"info":{"author":"xcode","version":1}}
+JSON_EOF
+
+# ── project.pbxproj ──────────────────────────────────────────────────────────
+cat > "$PROJECT_DIR/PythonRunner.xcodeproj/project.pbxproj" << 'PBX_EOF'
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A001 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = B001 /* AppDelegate.swift */; };
+		A002 /* MainViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B002 /* MainViewController.swift */; };
+		A003 /* EditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B003 /* EditorView.swift */; };
+		A004 /* OutputView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B004 /* OutputView.swift */; };
+		A005 /* PythonRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = B005 /* PythonRunner.swift */; };
+		A006 /* PythonWrapper.m in Sources */ = {isa = PBXBuildFile; fileRef = B006 /* PythonWrapper.m */; };
+		A007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B007 /* Assets.xcassets */; };
+		A008 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = B008 /* LaunchScreen.storyboard */; };
+		A009 /* Python.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = B009 /* Python.xcframework */; };
+		A010 /* Python.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = B009 /* Python.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		A011 /* CancellationState.swift in Sources */ = {isa = PBXBuildFile; fileRef = B015 /* CancellationState.swift */; };
+		A012 /* ExecutionState.swift in Sources */ = {isa = PBXBuildFile; fileRef = B016 /* ExecutionState.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		C001 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				A010 /* Python.xcframework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		B001 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		B002 /* MainViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainViewController.swift; sourceTree = "<group>"; };
+		B003 /* EditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorView.swift; sourceTree = "<group>"; };
+		B004 /* OutputView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutputView.swift; sourceTree = "<group>"; };
+		B005 /* PythonRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PythonRunner.swift; sourceTree = "<group>"; };
+		B006 /* PythonWrapper.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = PythonWrapper.m; sourceTree = "<group>"; };
+		B007 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B008 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		B009 /* Python.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = Python.xcframework; sourceTree = "<group>"; };
+		B011 /* PythonWrapper.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = PythonWrapper.h; sourceTree = "<group>"; };
+		B012 /* PythonRunner-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "PythonRunner-Bridging-Header.h"; sourceTree = "<group>"; };
+		B013 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B014 /* PythonRunner.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PythonRunner.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B015 /* CancellationState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CancellationState.swift; sourceTree = "<group>"; };
+		B016 /* ExecutionState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExecutionState.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		D001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A009 /* Python.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		E001 = {
+			isa = PBXGroup;
+			children = (
+				E002 /* PythonRunner */,
+				E003 /* Frameworks */,
+				E004 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		E002 /* PythonRunner */ = {
+			isa = PBXGroup;
+			children = (
+				E005 /* App */,
+				E006 /* UI */,
+				E007 /* Python */,
+				E008 /* Resources */,
+				B007 /* Assets.xcassets */,
+			);
+			path = PythonRunner;
+			sourceTree = "<group>";
+		};
+		E003 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				B009 /* Python.xcframework */,
+			);
+			path = Frameworks;
+			sourceTree = "<group>";
+		};
+		E004 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				B014 /* PythonRunner.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		E005 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				B001 /* AppDelegate.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		E006 /* UI */ = {
+			isa = PBXGroup;
+			children = (
+				B002 /* MainViewController.swift */,
+				B003 /* EditorView.swift */,
+				B004 /* OutputView.swift */,
+			);
+			path = UI;
+			sourceTree = "<group>";
+		};
+		E007 /* Python */ = {
+			isa = PBXGroup;
+			children = (
+				B005 /* PythonRunner.swift */,
+				B006 /* PythonWrapper.m */,
+				B011 /* PythonWrapper.h */,
+				B012 /* PythonRunner-Bridging-Header.h */,
+				B015 /* CancellationState.swift */,
+				B016 /* ExecutionState.swift */,
+			);
+			path = Python;
+			sourceTree = "<group>";
+		};
+		E008 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				B013 /* Info.plist */,
+				B008 /* LaunchScreen.storyboard */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		F001 /* PythonRunner */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = G001 /* Build configuration list for PBXNativeTarget "PythonRunner" */;
+			buildPhases = (
+				H001 /* Sources */,
+				H002 /* Resources */,
+				H003 /* Install Python Stdlib */,
+				D001 /* Frameworks */,
+				C001 /* Embed Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = PythonRunner;
+			productName = PythonRunner;
+			productReference = B014 /* PythonRunner.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		I001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+			};
+			buildConfigurationList = G002 /* Build configuration list for PBXProject "PythonRunner" */;
+			compatibilityVersion = "Xcode 15.0";
+			developmentRegion = fr;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				fr,
+				Base,
+			);
+			mainGroup = E001;
+			productRefGroup = E004 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				F001 /* PythonRunner */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		H002 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A007 /* Assets.xcassets in Resources */,
+				A008 /* LaunchScreen.storyboard in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		H003 /* Install Python Stdlib */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/python_paths.env",
+			);
+			name = "Install Python Stdlib";
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/python/lib",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "set -euo pipefail\nENV_FILE=\"$SRCROOT/python_paths.env\"\n[ -f \"$ENV_FILE\" ] || { echo \"❌ python_paths.env manquant — lancez ./setup.sh\"; exit 1; }\nsource \"$ENV_FILE\"\nDEST=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/python/lib\"\nmkdir -p \"$DEST\"\nif [ \"${EFFECTIVE_PLATFORM_NAME:-}\" = \"-iphonesimulator\" ]; then SRC=\"$SIMULATOR_LIB\"; else SRC=\"$DEVICE_LIB\"; fi\n[ -d \"$SRC\" ] || { echo \"❌ $SRC introuvable\"; exit 1; }\nrsync -a \"$SRC/\" \"$DEST/\"\necho \"✅ $SRC → $DEST\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		H001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A001 /* AppDelegate.swift in Sources */,
+				A002 /* MainViewController.swift in Sources */,
+				A003 /* EditorView.swift in Sources */,
+				A004 /* OutputView.swift in Sources */,
+				A005 /* PythonRunner.swift in Sources */,
+				A006 /* PythonWrapper.m in Sources */,
+				A011 /* CancellationState.swift in Sources */,
+				A012 /* ExecutionState.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		J001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_BITCODE = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		J002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_BITCODE = NO;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		J003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/Frameworks",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/Frameworks/Python.xcframework/ios-arm64/Headers",
+					"$(PROJECT_DIR)/Frameworks/Python.xcframework/ios-arm64/include",
+					"$(PROJECT_DIR)/Frameworks/Python.xcframework/ios-arm64_x86_64-simulator/Headers",
+					"$(PROJECT_DIR)/Frameworks/Python.xcframework/ios-arm64_x86_64-simulator/include",
+				);
+				INFOPLIST_FILE = "PythonRunner/Resources/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"-framework",
+					Python,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.pythonrunner.ios;
+				PRODUCT_NAME = PythonRunner;
+				SWIFT_OBJC_BRIDGING_HEADER = "PythonRunner/Python/PythonRunner-Bridging-Header.h";
+			};
+			name = Debug;
+		};
+		J004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/Frameworks",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/Frameworks/Python.xcframework/ios-arm64/Headers",
+					"$(PROJECT_DIR)/Frameworks/Python.xcframework/ios-arm64/include",
+					"$(PROJECT_DIR)/Frameworks/Python.xcframework/ios-arm64_x86_64-simulator/Headers",
+					"$(PROJECT_DIR)/Frameworks/Python.xcframework/ios-arm64_x86_64-simulator/include",
+				);
+				INFOPLIST_FILE = "PythonRunner/Resources/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"-framework",
+					Python,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.pythonrunner.ios;
+				PRODUCT_NAME = PythonRunner;
+				SWIFT_OBJC_BRIDGING_HEADER = "PythonRunner/Python/PythonRunner-Bridging-Header.h";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		G001 /* Build configuration list for PBXNativeTarget "PythonRunner" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				J003 /* Debug */,
+				J004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		G002 /* Build configuration list for PBXProject "PythonRunner" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				J001 /* Debug */,
+				J002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = I001 /* Project object */;
+}
+PBX_EOF
+
+# ── Workspace (VALIDE) ───────────────────────────────────────────────────────
+cat > "$PROJECT_DIR/PythonRunner.xcodeproj/project.xcworkspace/contents.xcworkspacedata" << 'XML_EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<Workspace
+   version = "1.0">
+   <FileRef
+      location = "self:">
+   </FileRef>
+</Workspace>
+XML_EOF
+
+# ── Scheme (VALIDE) ──────────────────────────────────────────────────────────
+cat > "$PROJECT_DIR/PythonRunner.xcodeproj/xcshareddata/xcschemes/PythonRunner.xcscheme" << 'SCHEME_EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<Scheme
+   LastUpgradeVersion = "1500"
+   version = "1.7">
+   <BuildAction
+      parallelizeBuildables = "YES"
+      buildImplicitDependencies = "YES">
+      <BuildActionEntries>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "F001"
+               BuildableName = "PythonRunner.app"
+               BlueprintName = "PythonRunner"
+               ReferencedContainer = "container:PythonRunner.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+      </BuildActionEntries>
+   </BuildAction>
+   <TestAction
+      buildConfiguration = "Debug"
+      selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
+      selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
+      shouldUseLaunchSchemeArgsEnv = "YES"
+      shouldAutocreateTestPlan = "YES">
+   </TestAction>
+   <LaunchAction
+      buildConfiguration = "Debug"
+      selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
+      selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
+      launchStyle = "0"
+      useCustomWorkingDirectory = "NO"
+      ignoresPersistentStateOnLaunch = "NO"
+      debugDocumentVersioning = "YES"
+      debugServiceExtension = "internal"
+      allowLocationSimulation = "YES">
+      <BuildableProductRunnable
+         runnableDebuggingMode = "0">
+         <BuildableReference
+            BuildableIdentifier = "primary"
+            BlueprintIdentifier = "F001"
+            BuildableName = "PythonRunner.app"
+            BlueprintName = "PythonRunner"
+            ReferencedContainer = "container:PythonRunner.xcodeproj">
+         </BuildableReference>
+      </BuildableProductRunnable>
+   </LaunchAction>
+   <ProfileAction
+      buildConfiguration = "Release"
+      shouldUseLaunchSchemeArgsEnv = "YES"
+      savedToolIdentifier = ""
+      useCustomWorkingDirectory = "NO"
+      debugDocumentVersioning = "YES">
+      <BuildableProductRunnable
+         runnableDebuggingMode = "0">
+         <BuildableReference
+            BuildableIdentifier = "primary"
+            BlueprintIdentifier = "F001"
+            BuildableName = "PythonRunner.app"
+            BlueprintName = "PythonRunner"
+            ReferencedContainer = "container:PythonRunner.xcodeproj">
+         </BuildableReference>
+      </BuildableProductRunnable>
+   </ProfileAction>
+   <AnalyzeAction
+      buildConfiguration = "Debug">
+   </AnalyzeAction>
+   <ArchiveAction
+      buildConfiguration = "Release"
+      revealArchiveInOrganizer = "YES">
+   </ArchiveAction>
+</Scheme>
+SCHEME_EOF
+
+# ── setup.sh ─────────────────────────────────────────────────────────────────
+cat > "$PROJECT_DIR/setup.sh" << 'SH_EOF'
+#!/bin/bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+PYTHON_VER="3.11"
+BEEWARE_RELEASE="3.11-b9"
+BEEWARE_URL="https://github.com/beeware/Python-Apple-support/releases/download/${BEEWARE_RELEASE}/Python-3.11-iOS-support.b9.tar.gz"
+FRAMEWORKS_DIR="$SCRIPT_DIR/Frameworks"
+
+echo "════════════════════════════════════════════════════════"
+echo "  setup.sh V6.3.11 — $BEEWARE_RELEASE"
+echo "════════════════════════════════════════════════════════"
+
+for cmd in curl tar rsync python3; do
+  command -v "$cmd" &>/dev/null || { echo "❌ commande manquante : $cmd"; exit 1; }
+done
+mkdir -p "$FRAMEWORKS_DIR"
+
+ARCHIVE="$FRAMEWORKS_DIR/Python-3.11-iOS-support.b9.tar.gz"
+
+# Conservé dans Frameworks/ pour le cache GitHub Actions
+# (path: PythonRunner/Frameworks/Python-3.11-iOS-support.b9.tar.gz)
+if [ ! -s "$ARCHIVE" ]; then
+  echo "📥 Téléchargement de Python-Apple-support $BEEWARE_RELEASE..."
+  CODE=$(curl -L --fail --retry 3 --retry-delay 2 \
+    -A "PythonRunner-setup/6.3.11" \
+    -o "$ARCHIVE" \
+    -w "%{http_code}" \
+    "$BEEWARE_URL" || true)
+  if [ "$CODE" != "200" ] || [ ! -s "$ARCHIVE" ]; then
+    rm -f "$ARCHIVE"
+    echo "❌ téléchargement BeeWare refusé (HTTP ${CODE:-curl-fail})"
+    echo "   URL : $BEEWARE_URL"
+    exit 1
+  fi
+  echo "✅ archive enregistrée : $ARCHIVE"
+else
+  echo "✅ archive déjà présente (cache) : $ARCHIVE"
+fi
+
+if [ ! -f "$FRAMEWORKS_DIR/Python.xcframework/Info.plist" ]; then
+  echo "📦 Extraction..."
+  tar -xzf "$ARCHIVE" -C "$FRAMEWORKS_DIR/"
+  [ -d "$FRAMEWORKS_DIR/Python.xcframework" ] || { echo "❌ Extraction échouée"; exit 1; }
+  echo "✅ XCFramework installé"
+else
+  echo "✅ XCFramework déjà présent"
+fi
+
+DEV="$FRAMEWORKS_DIR/Python.xcframework/ios-arm64"
+SIM="$FRAMEWORKS_DIR/Python.xcframework/ios-arm64_x86_64-simulator"
+
+[ -d "$DEV" ] || { echo "❌ Slice device manquante : $DEV"; ls -la "$FRAMEWORKS_DIR/Python.xcframework/" || true; exit 1; }
+[ -d "$SIM" ] || { echo "❌ Slice simulateur manquante : $SIM"; exit 1; }
+[ -d "$DEV/lib/python$PYTHON_VER" ] || { echo "❌ PYTHONHOME device manquant"; find "$DEV" -maxdepth 3 -type d | head -30; exit 1; }
+[ -d "$SIM/lib/python$PYTHON_VER" ] || { echo "❌ PYTHONHOME sim manquant"; exit 1; }
+
+ST="$DEV/lib/python$PYTHON_VER"
+for f in os.py site.py; do
+  [ -f "$ST/$f" ] || { echo "❌ $f manquant dans la stdlib"; exit 1; }
+done
+[ -d "$ST/encodings" ] || { echo "❌ dossier encodings manquant"; exit 1; }
+
+# ── Détection dynamique de Python.h ─────────────────────────────────────────
+# BeeWare 3.11 place les headers dans slice/include/ (souvent include/Python/Python.h).
+# On détecte le vrai -I, on injecte dans le pbxproj.
+# Symlinks Headers/include uniquement si absents (compat HEADER_SEARCH_PATHS statiques).
+
+find_python_h_dir() {
+  local slice="$1"
+  local candidates=(
+    "$slice/Headers/Python.h"
+    "$slice/include/Python.h"
+    "$slice/Headers/Python/Python.h"
+    "$slice/include/Python/Python.h"
+  )
+  for c in "${candidates[@]}"; do
+    if [ -f "$c" ]; then
+      # Retourne le dossier parent de Python.h (celui à ajouter en -I)
+      dirname "$c"
+      return 0
+    fi
+  done
+  # Recherche plus large
+  local found
+  found=$(find "$slice" -name "Python.h" 2>/dev/null | head -1 || true)
+  if [ -n "$found" ]; then
+    dirname "$found"
+    return 0
+  fi
+  return 1
+}
+
+normalize_headers() {
+  local slice="$1"
+  local real_dir
+  real_dir=$(find_python_h_dir "$slice") || {
+    echo "❌ CRITIQUE : Python.h introuvable dans $slice"
+    find "$slice" -maxdepth 3 -type d 2>/dev/null | head -30 || true
+    find "$slice" -name "Python.h" 2>/dev/null | head -10 || true
+    exit 1
+  }
+  echo "✅ Header dir ($slice) : $real_dir"
+
+  # Si Python.h est dans .../Python/, le -I doit pointer sur le parent de Python/
+  # pour que #include <Python/Python.h> ou #include <Python/Python.h> marchent.
+  local include_root
+  if [ "$(basename "$real_dir")" = "Python" ]; then
+    include_root="$(dirname "$real_dir")"
+  else
+    include_root="$real_dir"
+  fi
+
+  # Créer / normaliser Headers et include pour coller au HEADER_SEARCH_PATHS du pbxproj
+  if [ ! -e "$slice/Headers" ]; then
+    ln -sfn "$(basename "$include_root")" "$slice/Headers" 2>/dev/null || \
+      ln -sfn "$include_root" "$slice/Headers"
+    # Si le lien relatif est bizarre, forcer un lien absolu propre
+    if [ ! -e "$slice/Headers/Python.h" ] && [ ! -e "$slice/Headers/Python/Python.h" ]; then
+      rm -f "$slice/Headers"
+      ln -sfn "$include_root" "$slice/Headers"
+    fi
+    echo "   → symlink Headers → $include_root"
+  fi
+  if [ ! -e "$slice/include" ]; then
+    ln -sfn "$(basename "$include_root")" "$slice/include" 2>/dev/null || \
+      ln -sfn "$include_root" "$slice/include"
+    if [ ! -e "$slice/include/Python.h" ] && [ ! -e "$slice/include/Python/Python.h" ]; then
+      rm -f "$slice/include"
+      ln -sfn "$include_root" "$slice/include"
+    fi
+    echo "   → symlink include → $include_root"
+  fi
+
+  # Vérification finale
+  if [ ! -f "$slice/Headers/Python.h" ] && [ ! -f "$slice/Headers/Python/Python.h" ] && \
+     [ ! -f "$slice/include/Python.h" ] && [ ! -f "$slice/include/Python/Python.h" ]; then
+    echo "❌ Impossible de normaliser les headers pour $slice"
+    ls -la "$slice" || true
+    exit 1
+  fi
+  echo "$include_root"
+}
+
+DEVICE_HEADER_ROOT=$(normalize_headers "$DEV")
+SIM_HEADER_ROOT=$(normalize_headers "$SIM")
+
+# Test de compilation optionnel (si xcrun/clang disponibles)
+if command -v xcrun &>/dev/null; then
+  echo "🧪 Test include Python.h..."
+  TEST_C=$(mktemp /tmp/pyhdr.XXXXXX.c)
+  TEST_O=$(mktemp /tmp/pyhdr.XXXXXX.o)
+  cat > "$TEST_C" << 'CTEST'
+#include <Python/Python.h>
+int main(void) { return 0; }
+CTEST
+  if xcrun --sdk iphonesimulator clang -c "$TEST_C" \
+      -I"$SIM/Headers" -I"$SIM/include" \
+      -o "$TEST_O" 2>/tmp/pyhdr_err.txt; then
+    echo "✅ Compilation test Python.h (simulateur) OK"
+  else
+    echo "⚠️  Compilation test a échoué (non bloquant si headers présents) :"
+    cat /tmp/pyhdr_err.txt 2>/dev/null | head -20 || true
+  fi
+  rm -f "$TEST_C" "$TEST_O" /tmp/pyhdr_err.txt
+else
+  echo "ℹ️  xcrun absent — skip test compilation headers"
+fi
+
+cat > "$SCRIPT_DIR/python_paths.env" << EOF
+export PYTHON_VER="$PYTHON_VER"
+export DEVICE_LIB="$DEV/lib"
+export SIMULATOR_LIB="$SIM/lib"
+export DEVICE_SLICE="$DEV"
+export SIMULATOR_SLICE="$SIM"
+export DEVICE_HEADER_ROOT="$DEVICE_HEADER_ROOT"
+export SIMULATOR_HEADER_ROOT="$SIM_HEADER_ROOT"
+EOF
+echo "✅ python_paths.env écrit"
+
+# Inject discovered absolute header roots into project.pbxproj HEADER_SEARCH_PATHS
+export PBX="$SCRIPT_DIR/PythonRunner.xcodeproj/project.pbxproj"
+export DEVICE_HEADER_ROOT SIMULATOR_HEADER_ROOT
+if [ -f "$PBX" ]; then
+  # Remove previous injected lines if re-run
+  if sed --version >/dev/null 2>&1; then
+    sed -i '/\/\* setup.sh injected \*\//d' "$PBX"
+  else
+    sed -i '' '/\/\* setup.sh injected \*\//d' "$PBX"
+  fi
+  python3 - <<'PYINJECT'
+import re, os, pathlib
+pbx = pathlib.Path(os.environ["PBX"])
+dev = os.environ["DEVICE_HEADER_ROOT"]
+sim = os.environ["SIMULATOR_HEADER_ROOT"]
+text = pbx.read_text()
+inject = f'\n\t\t\t\t\t"{dev}", /* setup.sh injected */\n\t\t\t\t\t"{sim}", /* setup.sh injected */'
+def repl(m):
+    block = m.group(0)
+    if "setup.sh injected" in block:
+        return block
+    return block.replace("HEADER_SEARCH_PATHS = (", "HEADER_SEARCH_PATHS = (" + inject, 1)
+text2, n = re.subn(r"HEADER_SEARCH_PATHS = \([^;]*?\);", repl, text, flags=re.S)
+pbx.write_text(text2)
+print(f"✅ pbxproj HEADER_SEARCH_PATHS patched ({n} blocks)")
+PYINJECT
+fi
+
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo "  ✅ setup terminé"
+echo "════════════════════════════════════════════════════════"
+echo "Prochaine étape :"
+echo "  open $SCRIPT_DIR/PythonRunner.xcodeproj"
+echo "  → Sélectionnez votre Team de signature"
+echo "  → Choisissez un simulateur ou un appareil"
+echo "  → ⌘B / ⌘R"
+echo ""
+echo "Rappel : ./setup.sh est obligatoire avant le premier build."
+SH_EOF
+chmod +x "$PROJECT_DIR/setup.sh"
+
+cat > "$PROJECT_DIR/README.md" << 'MD_EOF'
+# PythonRunner V6.3.11
+
+## Changements V6.3.11 (milestone)
+- **Cancel sticky fix** : acknowledgeStart() aussi sur le chemin « déjà annulé »
+- Init partielle : ne pas retourner YES si Py_IsInitialized mais setup incomplet
+- Py_AddPendingCall : check retour + fallback PyErr_SetInterrupt()
+- Soft finalize aligné Swift/C (pas de isInitialized=false trompeur)
+- showPackages() asynchrone (plus de freeze UI)
+- (Hérité) PyConfig_SetBytesString, URL BeeWare, race Stop file d'attente
+
+## Utilisation
+```bash
+chmod +x generate_pythonrunner_v6.3.11.sh
+./generate_pythonrunner_v6.3.11.sh
+cd PythonRunner
+./setup.sh
+open PythonRunner.xcodeproj
+```
+Team → Simulateur ou iPhone → ⌘B / ⌘R
+
+## Limitations
+- Timeout 30 s coopératif
+- Pas d’installateur de packages tiers
+- AppIcon placeholder
+- Internet requis la 1ʳᵉ fois (BeeWare 3.11-b9)
+- Linkage Python.xcframework à valider par un vrai build
+
+Deployment target : iOS 15.0
+MD_EOF
+
+# ── .gitignore (ne pas committer BeeWare / DerivedData) ──────────────────────
+cat > .gitignore << 'GI_EOF'
+.DS_Store
+xcuserdata/
+DerivedData/
+*.xcuserstate
+PythonRunner/Frameworks/Python-3.11-iOS-support.b9.tar.gz
+PythonRunner/Frameworks/Python.xcframework/
+PythonRunner/Frameworks/_extract_*
+PythonRunner/Frameworks/Headers/
+PythonRunner/python_paths.env
+GI_EOF
+
+# ── GitHub Actions (racine du dépôt = dossier courant) ───────────────────────
+mkdir -p .github/workflows
+cat > .github/workflows/main.yml << 'YML_EOF'
+name: PythonRunner V6.3.11
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ios:
+    name: generate + setup + build (simulator)
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Arborescence
+        run: |
+          set -euo pipefail
+          echo "PWD=$(pwd)"
+          ls -la
+          find . -maxdepth 4 \( -name 'setup.sh' -o -name 'generate_pythonrunner*.sh' -o -name '*.xcodeproj' \) -print | sort
+
+      - name: Garantir PythonRunner/setup.sh
+        run: |
+          set -euo pipefail
+          if [ -f PythonRunner/setup.sh ]; then
+            echo "✅ PythonRunner/setup.sh déjà dans le commit"
+          else
+            echo "⚠️  PythonRunner/setup.sh absent — génération sur le runner"
+            GEN=""
+            for c in generate_pythonrunner_v6.3.11.sh generate_pythonrunner_v6.3.sh generatepythonrunnerv6.3.sh; do
+              [ -f "$c" ] && GEN="$c" && break
+            done
+            if [ -z "$GEN" ]; then
+              GEN="$(find . -maxdepth 2 -name 'generate_pythonrunner*.sh' -print -quit || true)"
+            fi
+            if [ -z "$GEN" ] || [ ! -f "$GEN" ]; then
+              echo "❌ Ni PythonRunner/setup.sh ni générateur dans le dépôt."
+              echo "   git add generate_pythonrunner_v6.3.11.sh PythonRunner .github"
+              find . -maxdepth 4 -name 'setup.sh' -print || true
+              exit 1
+            fi
+            echo "▶️  $GEN"
+            chmod +x "$GEN"
+            bash "$GEN"
+          fi
+          test -f PythonRunner/setup.sh
+          chmod +x PythonRunner/setup.sh
+          echo "✅ PythonRunner/setup.sh OK"
+
+      - name: Cache BeeWare
+        uses: actions/cache@v4
+        with:
+          path: PythonRunner/Frameworks/Python-3.11-iOS-support.b9.tar.gz
+          key: beeware-3.11-b9
+
+      - name: setup.sh
+        working-directory: PythonRunner
+        run: ./setup.sh
+
+      - name: xcodebuild -list
+        working-directory: PythonRunner
+        run: xcodebuild -project PythonRunner.xcodeproj -scheme PythonRunner -list
+
+      - name: Build simulateur (sans signature)
+        working-directory: PythonRunner
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project PythonRunner.xcodeproj \
+            -scheme PythonRunner \
+            -configuration Debug \
+            -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+YML_EOF
+echo "   ✅ .github/workflows/main.yml"
+
+# ── Vérification locale ──────────────────────────────────────────────────────
+test -f "$PROJECT_DIR/setup.sh" || { echo "❌ $PROJECT_DIR/setup.sh manquant"; exit 1; }
+test -f "$PROJECT_DIR/PythonRunner.xcodeproj/project.pbxproj" || { echo "❌ pbxproj manquant"; exit 1; }
+test -f .github/workflows/main.yml || { echo "❌ workflow manquant"; exit 1; }
+chmod +x "$PROJECT_DIR/setup.sh"
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "  ✅ Génération V6.3.11 OK"
+echo "     $PROJECT_DIR/setup.sh"
+echo "     $PROJECT_DIR/PythonRunner.xcodeproj"
+echo "     .github/workflows/main.yml"
+echo ""
+echo "  Local :"
+echo "     cd $PROJECT_DIR && ./setup.sh"
+echo "     open PythonRunner.xcodeproj"
+echo ""
+echo "  GitHub (obligatoire, sinon CI ne voit pas setup.sh) :"
+echo "     git add generate_pythonrunner_v6.3.11.sh .github PythonRunner .gitignore"
+echo "     git commit -m \"PythonRunner V6.3.11\""
+echo "     git push"
+echo "═══════════════════════════════════════════════════════════════"
